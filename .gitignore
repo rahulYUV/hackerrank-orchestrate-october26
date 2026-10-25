@@ -1,0 +1,24 @@
+# Python bytecode and environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local credentials and signing material
+.env
+*.key
+*.pem
+*.p12
+*.pfx
+*.token
+
+# Generated databases and archives
+code/observations.sqlite
+*.sqlite
+*.zip
+
+# Generated output variants
+output_v*.csv
+
+# Scratch diagnostics
+code/check.py
