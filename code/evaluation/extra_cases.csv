@@ -1,0 +1,4 @@
+case_id,email,requested_at,reported_status,reported_at,audit_at,request_text,scenario
+extra_historical_email_01,o.walker6695@yahoo.com,2026-10-01T09:00:00Z,COMPLETE,2026-10-01T10:00:00Z,2026-10-02T09:00:00Z,Please erase my account and disconnect every remaining copy of my personal data.,historical_email_identity
+extra_keep_update_de_02,amina.elmasri@gmail.com,2026-10-01T09:00:00Z,COMPLETE,2026-10-01T10:00:00Z,2026-10-02T09:00:00Z,Bitte behalten Sie mein Konto und aktualisieren Sie meine Anschrift; ich möchte auch meine Telefonnummer ändern.,non_deletion_keep_and_update_german
+extra_early_audit_03,aarav.r528@outlook.com,2026-01-27T11:44:59Z,COMPLETE,2026-01-28T11:44:59Z,2026-01-29T11:44:58Z,I request erasure of my account and its copies across the service.,audit_cutoff_before_subject_evidence
