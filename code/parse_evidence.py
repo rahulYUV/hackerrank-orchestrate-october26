@@ -11,8 +11,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
+import shutil
 import sqlite3
+import subprocess
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
@@ -21,8 +24,8 @@ from typing import Any, Iterable
 ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE_ROOT = ROOT / "dataset" / "evidence"
 MANIFEST = ROOT / "dataset" / "evidence_files.csv"
-SUPPORTED = {".sql", ".log", ".json", ".txt", ".pdf"}
-SKIPPED = {".png"}
+SUPPORTED = {".sql", ".log", ".json", ".txt", ".pdf", ".png"}
+SKIPPED: set[str] = set()
 
 TIME_KEYS = (
     "captured_at", "recorded_at", "event_at", "created_at", "updated_at",
@@ -434,6 +437,174 @@ def parse_pdf(db: sqlite3.Connection, evidence_id: str, path: Path, file_time: s
     return count
 
 
+OCR_RESOURCE_TYPES = (
+    ("account_", "account_service", "USER_PROFILE"),
+    ("search_", "search_service", "SEARCH_INDEX_ENTRY"),
+    ("support_", "support_platform", "SUPPORT_ATTACHMENT"),
+    ("analytics_", "analytics_platform", "ANALYTICS_PROFILE"),
+    ("export_", "export_service", "USER_EXPORT"),
+    ("data_flow_", "integration_service", "DATA_FLOW"),
+    ("backup_", "backup_service", "BACKUP_ARCHIVE"),
+    ("audit_record_", "security_service", "SECURITY_AUDIT_LOG"),
+    ("tombstone_", "identity_service", "ACCOUNT_TOMBSTONE"),
+    ("marketing_", "marketing_platform", "MARKETING_PROFILE"),
+    ("object_", "object_storage", "SUPPORT_ATTACHMENT"),
+)
+OCR_RESOURCE_RE = re.compile(r"\b(?:" + "|".join(re.escape(x[0]) for x in OCR_RESOURCE_TYPES) + r")\d+\b", re.I)
+
+
+def tesseract_executable() -> str | None:
+    """Prefer the configured executable, then the documented default, then PATH."""
+    configured = os.environ.get("TESSERACT_CMD", "").strip().strip('"')
+    default = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    for candidate in (configured, default):
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return shutil.which("tesseract")
+
+
+def read_catalog_owners() -> dict[tuple[str, str], list[dict[str, str]]]:
+    owners: dict[tuple[str, str], list[dict[str, str]]] = {}
+    with (ROOT / "dataset" / "system_activity.csv").open(encoding="utf-8-sig", newline="") as stream:
+        for row in csv.DictReader(stream):
+            if (normalize(row.get("event_type")).upper() != "LINK_RESOURCE_IDENTITY" or
+                    normalize(row.get("source_system")).casefold() != "data_catalog"):
+                continue
+            details = normalize(row.get("details"))
+            email = re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", details)
+            user_id = re.search(r"\buser_\d+\b", details, flags=re.I)
+            owners.setdefault((normalize(row.get("target_system")), normalize(row.get("resource_id"))), []).append(
+                {"email": email.group(0) if email else "", "user_id": user_id.group(0) if user_id else "",
+                 "details": details})
+    return owners
+
+
+def read_identity_tokens() -> dict[str, str]:
+    """Map participant-visible current and historical identity values to stable user IDs."""
+    result: dict[str, str] = {}
+    paths = (ROOT / "dataset" / "user_identities.csv", ROOT / "dataset" / "user_audit_log.csv")
+    for path in paths:
+        with path.open(encoding="utf-8-sig", newline="") as stream:
+            for row in csv.DictReader(stream):
+                uid = normalize(row.get("user_id"))
+                if not uid:
+                    continue
+                result[uid.casefold()] = uid
+                fields = ("name", "full_name", "email", "phone", "email_hash")
+                if path.name == "user_audit_log.csv":
+                    field = normalize(row.get("field_name")).casefold()
+                    if field not in {"name", "full_name", "email", "phone", "email_hash", "email_sha256"}:
+                        continue
+                    fields = ("old_value", "new_value")
+                for key in fields:
+                    value = normalize(row.get(key))
+                    if value:
+                        result[value.casefold()] = uid
+    return result
+
+
+def read_identity_names() -> dict[str, str]:
+    with (ROOT / "dataset" / "user_identities.csv").open(encoding="utf-8-sig", newline="") as stream:
+        return {normalize(row.get("user_id")): normalize(row.get("name"))
+                for row in csv.DictReader(stream) if normalize(row.get("user_id")) and normalize(row.get("name"))}
+
+
+def ocr_state(resource_id: str, context: str) -> tuple[str, str]:
+    folded = context.casefold()
+    rid = resource_id.casefold()
+    if rid.startswith("tombstone_"):
+        direct = re.search(r"\b(name|email|phone|email hash|email_sha256)\b\s*[:=]\s*(?!null\b|none\b|—|-)\S+", context, re.I)
+        return ("IDENTIFIABLE", "IDENTIFIABLE") if direct else ("REDACTED", "REDACTED") if "retained reference" in folded else ("PRESENT", "PRESENT")
+    if rid.startswith("data_flow_"):
+        if re.search(r"\b(disabled|inactive|paused|stopped)\b", folded):
+            return "DISABLED", "DISABLED"
+        if re.search(r"\b(active|enabled|continuous|healthy|running)\b", folded):
+            return "ACTIVE", "ACTIVE"
+    if rid.startswith("backup_"):
+        if re.search(r"\b(restore blocked|blocked|disabled|not restorable)\b", folded):
+            return "BLOCKED", "BLOCKED"
+        if re.search(r"\b(restore allowed|restorable|restore enabled|active)\b", folded):
+            return "ACTIVE", "ACTIVE"
+    if rid.startswith("audit_record_"):
+        return "PRESENT", "PRESENT"
+    if re.search(r"\b(live profile|live|active|present|exists|ready)\b", folded):
+        return "PRESENT", "PRESENT"
+    if re.search(r"\b(anonymized|anonymous)\b", folded):
+        return "ANONYMIZED", "ANONYMIZED"
+    if re.search(r"\b(redacted|removed identifiers)\b", folded):
+        return "REDACTED", "REDACTED"
+    return "PRESENT", "PRESENT"
+
+
+def parse_png(db: sqlite3.Connection, evidence_id: str, path: Path, file_time: str,
+              owners: dict[tuple[str, str], list[dict[str, str]]], identity_tokens: dict[str, str],
+              identity_names: dict[str, str], tesseract: str | None) -> tuple[int, list[str]]:
+    """OCR a screenshot and keep only resource IDs with grounded ownership links."""
+    if not tesseract:
+        return 0, []
+    result = subprocess.run([tesseract, str(path), "stdout", "--psm", "6"],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace",
+                            timeout=45, check=False)
+    text = result.stdout.strip()
+    db.execute("INSERT OR REPLACE INTO image_ocr (evidence_id, captured_at, ocr_text) VALUES (?, ?, ?)",
+               (evidence_id, file_time, text))
+    if result.returncode != 0 or not text:
+        return 0, []
+    lines = text.splitlines()
+    all_resource_ids = {m.group(0).casefold() for m in OCR_RESOURCE_RE.finditer(text)}
+    rows: dict[str, tuple[str, str, str, str, list[dict[str, str]]]] = {}
+    disagreements: list[str] = []
+    for match in OCR_RESOURCE_RE.finditer(text):
+        resource_id = match.group(0)
+        prefix = next((entry for entry in OCR_RESOURCE_TYPES if resource_id.casefold().startswith(entry[0])), None)
+        if not prefix:
+            continue
+        system, category = prefix[1], prefix[2]
+        line_no = next((i for i, line in enumerate(lines) if resource_id.casefold() in line.casefold()), 0)
+        local = "\n".join(lines[max(0, line_no - 2):min(len(lines), line_no + 3)])
+        ownership_context = lines[line_no] if len(all_resource_ids) > 1 else text
+        catalog = owners.get((system, resource_id), [])
+        # Catalog links are authoritative even when the screenshot shows another name.
+        linked_users = {o["user_id"] for o in catalog if o["user_id"]}
+        if not catalog:
+            for token, uid in identity_tokens.items():
+                if re.search(r"(?<![\w@.+-])" + re.escape(token) + r"(?![\w@.+-])", ownership_context, re.I):
+                    linked_users.add(uid)
+        if not catalog and not linked_users:
+            continue
+        owners_payload = catalog or [{"user_id": uid, "email": "", "details": "OCR identity text"} for uid in sorted(linked_users)]
+        # Compare the screenshot's visible full-name/email text with the catalog owner,
+        # but never let a conflicting label replace catalog ownership.
+        if catalog:
+            owner_uids = {o["user_id"] for o in catalog if o["user_id"]}
+            for token, uid in identity_tokens.items():
+                if uid not in owner_uids and len(token) > 5 and re.search(r"(?<![\w@.+-])" + re.escape(token) + r"(?![\w@.+-])", lines[line_no], re.I):
+                    disagreements.append(resource_id)
+                    break
+            owner_names = [identity_names[uid] for uid in owner_uids if uid in identity_names]
+            if len(all_resource_ids) == 1 and not any(name.casefold() in text.casefold() for name in owner_names):
+                nearby = "\n".join(lines[max(0, line_no - 2):line_no + 1])
+                ui_labels = {"northstar shop", "audience operations", "customer operations", "production help",
+                             "profile attributes", "customer search", "account platform", "live profile"}
+                name_candidates = re.findall(r"\b([A-Z][a-z]+(?:[-'][A-Za-z]+)?)\s+([A-Z][a-z]+(?:[-'][A-Za-z]+)?)\b", nearby)
+                if any((first + " " + last).casefold() not in ui_labels and
+                       all((first + " " + last).casefold() != name.casefold() for name in owner_names)
+                       for first, last in name_candidates):
+                    disagreements.append(resource_id)
+        state, normalized = ocr_state(resource_id, local)
+        rows[resource_id] = (system, category, state, normalized, owners_payload)
+
+    for resource_id, (system, category, state, normalized, owners_payload) in sorted(rows.items()):
+        hit = text.casefold().find(resource_id.casefold())
+        local = text[max(0, hit - 280):min(len(text), hit + len(resource_id) + 500)]
+        payload = {"ocr_evidence": True, "ocr_text": text, "resource_context": local,
+                   "owners": owners_payload, "resource_id": resource_id,
+                   "category": category, "state": state}
+        add_observation(db, evidence_id, file_time, system, resource_id, category,
+                        state, normalized, record_payload(payload))
+    return len(rows), sorted(set(disagreements))
+
+
 def parse_sql(db: sqlite3.Connection, evidence_id: str, path: Path, file_time: str) -> int:
     # Execute each SQL snapshot in an isolated SQLite database, then inspect its tables.
     count = 0
@@ -503,10 +674,16 @@ def build_database(output: Path | None = None, print_counts: bool = True) -> Pat
     files = sorted(path for path in EVIDENCE_ROOT.rglob("*") if path.is_file())
     format_counts: Counter[str] = Counter()
     record_counts: Counter[str] = Counter()
+    catalog_owners = read_catalog_owners()
+    identity_tokens = read_identity_tokens()
+    identity_names = read_identity_names()
+    tesseract = tesseract_executable()
+    ocr_disagreements: set[str] = set()
 
     with sqlite3.connect(output) as db:
         db.execute("DROP TABLE IF EXISTS observations")
         db.execute("DROP TABLE IF EXISTS sql_snapshots")
+        db.execute("DROP TABLE IF EXISTS image_ocr")
         db.execute("""CREATE TABLE observations (
             evidence_id TEXT NOT NULL,
             captured_at TEXT NOT NULL,
@@ -522,6 +699,11 @@ def build_database(output: Path | None = None, print_counts: bool = True) -> Pat
             captured_at TEXT NOT NULL,
             tables TEXT NOT NULL,
             row_counts TEXT NOT NULL
+        )""")
+        db.execute("""CREATE TABLE image_ocr (
+            evidence_id TEXT PRIMARY KEY,
+            captured_at TEXT NOT NULL,
+            ocr_text TEXT NOT NULL
         )""")
         db.execute("CREATE INDEX idx_observations_resource ON observations(resource_id)")
         db.execute("CREATE INDEX idx_observations_evidence ON observations(evidence_id)")
@@ -543,10 +725,14 @@ def build_database(output: Path | None = None, print_counts: bool = True) -> Pat
                     added = parse_text(db, evidence_id, path, captured_at)
                 elif ext == ".pdf":
                     added = parse_pdf(db, evidence_id, path, captured_at, metadata.get("origin", ""))
+                elif ext == ".png":
+                    added, conflicts = parse_png(db, evidence_id, path, captured_at,
+                                                 catalog_owners, identity_tokens, identity_names, tesseract)
+                    ocr_disagreements.update(f"{evidence_id}:{resource}" for resource in conflicts)
                 else:
                     added = parse_sql(db, evidence_id, path, captured_at)
                 record_counts[ext] += added
-            except (OSError, ValueError, sqlite3.Error) as exc:
+            except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as exc:
                 raise RuntimeError(f"Could not parse {path.relative_to(ROOT)}: {exc}") from exc
         db.commit()
 
@@ -555,6 +741,8 @@ def build_database(output: Path | None = None, print_counts: bool = True) -> Pat
         for ext, count in sorted(format_counts.items()):
             treatment = " (skipped)" if ext in SKIPPED else ""
             print(f"  {ext}: {count}{treatment}")
+        if ".png" in format_counts and not tesseract:
+            print("PNG OCR skipped; Tesseract unavailable (set TESSERACT_CMD or install it on PATH)")
         print("Observation counts by parsed format:")
         for ext in sorted(SUPPORTED):
             print(f"  {ext}: {record_counts[ext]}")
@@ -575,19 +763,8 @@ def build_database(output: Path | None = None, print_counts: bool = True) -> Pat
         print(f"Evidence IDs with zero observations (all manifest formats): {len(zero_ids)}")
         print(f"Evidence IDs with zero observations (parsed formats only): {len(parsed_ids - observed)}")
         print(f"Database: {output}")
-        import importlib.util
-        import shutil
-        pytesseract_available = importlib.util.find_spec("pytesseract") is not None
-        tesseract_available = shutil.which("tesseract") is not None
-        missing = []
-        if not pytesseract_available:
-            missing.append("pytesseract Python package")
-        if not tesseract_available:
-            missing.append("Tesseract OCR executable")
-        if missing:
-            print("PNG OCR skipped; unavailable: " + " and ".join(missing))
-        else:
-            print("PNG OCR runtime available; PNG extraction remains disabled")
+        print("OCR/catalog identity label conflicts (catalog ownership retained): " +
+              (", ".join(sorted(ocr_disagreements)) if ocr_disagreements else "none"))
     return output
 
 

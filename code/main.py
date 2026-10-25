@@ -251,6 +251,28 @@ def user_reference_match(payload: Any, user_ids: set[str]) -> bool:
     return False
 
 
+def observation_owner_match(payload: Any, identity_values: set[str], user_ids: set[str]) -> bool:
+    """Use catalog/locally linked OCR owners, never arbitrary screenshot list labels."""
+    parsed = payload
+    if isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed)
+        except (json.JSONDecodeError, TypeError):
+            return False
+    if isinstance(parsed, dict) and parsed.get("ocr_evidence") is True:
+        wanted_ids = {clean(value).casefold() for value in user_ids if clean(value)}
+        wanted_values = {clean(value).casefold() for value in identity_values if clean(value)}
+        for owner in parsed.get("owners", []):
+            if not isinstance(owner, dict):
+                continue
+            if clean(owner.get("user_id")).casefold() in wanted_ids:
+                return True
+            if clean(owner.get("email")).casefold() in wanted_values:
+                return True
+        return False
+    return matching_identity_in_payload(payload, identity_values) or user_reference_match(payload, user_ids)
+
+
 def audit_owner_match(payload: Any, user_ids: set[str]) -> bool:
     """Match an audit row's stable owner link, irrespective of capture time."""
     owner_keys = {"subject_ref", "subject_reference", "correlation_key"}
@@ -321,6 +343,8 @@ def category_for(system: str, resource: str, observed_category: str) -> str:
         return "USER_EXPORT"
     if rid.startswith("marketing_") or "marketing" in sys:
         return "MARKETING_PROFILE"
+    if rid.startswith("object_") or sys == "object_storage":
+        return "SUPPORT_ATTACHMENT"
     if rid.startswith("support_") or sys == "support_platform":
         if "attach" in cat or "attachment" in rid or "ticket_attachment" in cat:
             return "SUPPORT_ATTACHMENT"
@@ -447,7 +471,8 @@ def identity_candidate_pairs(identity_values: set[str], user_ids: set[str],
             ("export_", "export_service"), ("backup_", "backup_service"),
             ("data_flow_", "integration_service"), ("connector_", "integration_service"),
             ("audit_record_", "security_service"), ("tombstone_", "identity_service"),
-            ("legal_hold_", "legal_service"),
+            ("legal_hold_", "legal_service"), ("marketing_", "marketing_platform"),
+            ("object_", "object_storage"),
         )
         folded = resource_id.casefold()
         return next((system for prefix, system in prefixes if folded.startswith(prefix)), "")
@@ -469,7 +494,7 @@ def identity_candidate_pairs(identity_values: set[str], user_ids: set[str],
         # Later captures may establish ownership of a stable resource ID. They
         # never enter rows_by_pair, which is the source of state/citation and
         # remains strictly limited to captures at or before audit_at.
-        if matching_identity_in_payload(row["identifiers"], identity_values) or user_reference_match(row["identifiers"], user_ids):
+        if observation_owner_match(row["identifiers"], identity_values, user_ids):
             found.add(pair)
         if capture <= audit_at:
             rows_by_pair[pair].append(row)
@@ -516,8 +541,7 @@ def get_activity_candidates(request: dict[str, str], activities: list[dict[str, 
         if not linked:
             linked = any(token and token in details for token in user_id_set)
         if not linked:
-            linked = any(user_reference_match(obs["identifiers"], user_ids) or
-                         matching_identity_in_payload(obs["identifiers"], identity_values)
+            linked = any(observation_owner_match(obs["identifiers"], identity_values, user_ids)
                          for obs in rows_by_pair.get(pair, []))
         if linked:
             confirmed.add(pair)
